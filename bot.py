@@ -2,21 +2,26 @@ import asyncio
 import logging
 import os
 import re
-import subprocess
-import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import aiohttp
+from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from playwright.async_api import async_playwright
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_СЮДА_СВОЙ_ТОКЕН")
 TARGET_URL = "https://topbilet.kz/ru/event/platina-v-almaty-2"
 DISCOUNT_PERCENT = 40
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
 
 price_data = {
     "tickets": [],
@@ -36,106 +41,71 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 
-def ensure_chromium():
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True
-        )
-    except Exception as e:
-        logging.error(f"Не удалось скачать Chromium: {e}")
-
-
-async def collect_all_text(context) -> str:
-    full_text = ""
-    for p in context.pages:
-        try:
-            full_text += "\n" + await p.inner_text("body")
-        except Exception:
-            pass
-        for frame in p.frames:
-            try:
-                full_text += "\n" + await frame.inner_text("body")
-            except Exception:
-                pass
-    return full_text
+def extract_prices_from_text(text: str) -> list[dict]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    target_categories = [
+        ("Танцпол", "танцпол"),
+        ("Ранний Вход", "ранний вход"),
+        ("VIP", "vip")
+    ]
+    result = []
+    for display_name, prefix in target_categories:
+        found_price = None
+        for idx, line in enumerate(lines):
+            if prefix in line.lower():
+                chunk = " ".join(lines[idx:idx + 5])
+                match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*₸", chunk)
+                if match:
+                    num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
+                    if 3000 <= num <= 500000:
+                        found_price = num
+                        break
+        if found_price is not None:
+            final_price = round(found_price * (1 - DISCOUNT_PERCENT / 100))
+            result.append({"name": display_name, "price": final_price})
+        else:
+            result.append({"name": display_name, "price": None})
+    return result
 
 
 async def fetch_topbilet_prices(retry_on_empty: bool = True):
-    logging.info("Запускаю парсинг Topbilet...")
+    logging.info("Запускаю легкий парсинг Topbilet...")
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process",
-                    "--no-zygote"
-                ]
-            )
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 900}
-            )
-            page = await context.new_page()
+        async with aiohttp.ClientSession(headers=HEADERS) as session:
+            async with session.get(TARGET_URL, timeout=30) as resp:
+                html = await resp.text()
 
-            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(4000)
+            soup = BeautifulSoup(html, "html.parser")
+            combined_text = soup.get_text("\n")
 
-            buy_btn = page.get_by_text("Купить билет").locator("visible=true").first
-            await buy_btn.wait_for(state="visible", timeout=20000)
-            await buy_btn.scroll_into_view_if_needed()
-            await buy_btn.click(force=True)
+            extra_urls = set()
+            for tag in soup.find_all(["iframe", "a", "script"]):
+                src = tag.get("src") or tag.get("href") or ""
+                if any(k in src.lower() for k in ["widget", "ticket", "seat", "hall", "checkout", "buy", "event"]):
+                    if src.startswith("//"):
+                        src = "https:" + src
+                    elif src.startswith("/"):
+                        src = "https://topbilet.kz" + src
+                    if src.startswith("http") and src != TARGET_URL:
+                        extra_urls.add(src)
 
-            full_text = ""
-            for attempt in range(45):
-                await page.wait_for_timeout(1000)
-                full_text = await collect_all_text(context)
-                if "танцпол" in full_text.lower() and "₸" in full_text:
-                    await page.wait_for_timeout(1500)
-                    full_text = await collect_all_text(context)
-                    logging.info(f"Страница с ценами загрузилась за {attempt + 1} сек!")
-                    break
+            for script in soup.find_all("script"):
+                if script.string:
+                    for m in re.findall(r"https?://[^\s\"'<>]+(?:widget|ticket|hall|session|event)[^\s\"'<>]*", script.string):
+                        extra_urls.add(m)
 
-            await browser.close()
+            for url in list(extra_urls)[:8]:
+                try:
+                    async with session.get(url, timeout=15) as sub_resp:
+                        if sub_resp.status == 200:
+                            sub_text = await sub_resp.text()
+                            sub_soup = BeautifulSoup(sub_text, "html.parser")
+                            combined_text += "\n" + sub_soup.get_text("\n")
+                except Exception:
+                    pass
 
-            lines = [line.strip() for line in full_text.splitlines() if line.strip()]
-
-            target_categories = [
-                ("Танцпол", "танцпол"),
-                ("Ранний Вход", "ранний вход"),
-                ("VIP", "vip")
-            ]
-
-            result = []
-            found_any = False
-
-            for display_name, prefix in target_categories:
-                found_price = None
-
-                for idx, line in enumerate(lines):
-                    if line.lower().startswith(prefix):
-                        chunk = " ".join(lines[idx:idx + 4])
-                        match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*₸", chunk)
-                        if match:
-                            num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
-                            if 3000 <= num <= 500000:
-                                found_price = num
-                                break
-
-                if found_price is not None:
-                    found_any = True
-                    final_price = round(found_price * (1 - DISCOUNT_PERCENT / 100))
-                    result.append({
-                        "name": display_name,
-                        "price": final_price
-                    })
-                else:
-                    result.append({
-                        "name": display_name,
-                        "price": None
-                    })
+            result = extract_prices_from_text(combined_text)
+            found_any = any(item["price"] is not None for item in result)
 
             if found_any or not price_data["tickets"]:
                 price_data["tickets"] = result
@@ -198,7 +168,6 @@ async def cmd_force_update(message: types.Message):
 
 
 async def main():
-    ensure_chromium()
     await bot.set_my_commands([
         BotCommand(command="price", description="🎟 Актуальные цены")
     ])
