@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -19,8 +20,9 @@ ALMATY_TZ = ZoneInfo("Asia/Almaty")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "application/json, text/plain, */*",
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Referer": TARGET_URL,
 }
 
 price_data = {
@@ -41,70 +43,136 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 
-def extract_prices_from_text(text: str) -> list[dict]:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+def parse_prices_from_any(raw_text: str) -> list[dict]:
+    """Ищет цены как в обычном тексте, так и внутри JSON-ответов API виджетов."""
     target_categories = [
         ("Танцпол", "танцпол"),
         ("Ранний Вход", "ранний вход"),
         ("VIP", "vip")
     ]
+    found_map = {}
+
+    # 1. Пробуем распарсить как JSON (наиболее частый формат API билетных виджетов)
+    def walk_json(obj):
+        if isinstance(obj, dict):
+            name_val = ""
+            price_val = None
+            for k, v in obj.items():
+                kl = k.lower()
+                if kl in ("name", "title", "category", "sector", "tariff", "label") and isinstance(v, str):
+                    name_val = v.lower()
+                elif kl in ("price", "cost", "amount", "value", "minprice", "min_price"):
+                    if isinstance(v, (int, float)) and 3000 <= v <= 500000:
+                        price_val = int(v)
+                    elif isinstance(v, str) and v.isdigit() and 3000 <= int(v) <= 500000:
+                        price_val = int(v)
+            if name_val and price_val:
+                for display_name, prefix in target_categories:
+                    if prefix in name_val and display_name not in found_map:
+                        found_map[display_name] = price_val
+            for v in obj.values():
+                walk_json(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk_json(item)
+
+    try:
+        parsed = json.loads(raw_text)
+        walk_json(parsed)
+    except Exception:
+        pass
+
+    # 2. Если в JSON не нашлось, ищем регулярками по тексту/HTML/JS-переменным
+    if len(found_map) < 3:
+        clean_text = BeautifulSoup(raw_text, "html.parser").get_text("\n")
+        lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
+        for display_name, prefix in target_categories:
+            if display_name in found_map:
+                continue
+            for idx, line in enumerate(lines):
+                if prefix in line.lower():
+                    chunk = " ".join(lines[idx:idx + 5])
+                    match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*(?:₸|KZT|тг)?", chunk, re.IGNORECASE)
+                    if match:
+                        num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
+                        if 3000 <= num <= 500000:
+                            found_map[display_name] = num
+                            break
+
     result = []
-    for display_name, prefix in target_categories:
-        found_price = None
-        for idx, line in enumerate(lines):
-            if prefix in line.lower():
-                chunk = " ".join(lines[idx:idx + 5])
-                match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*₸", chunk)
-                if match:
-                    num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
-                    if 3000 <= num <= 500000:
-                        found_price = num
-                        break
-        if found_price is not None:
-            final_price = round(found_price * (1 - DISCOUNT_PERCENT / 100))
-            result.append({"name": display_name, "price": final_price})
+    for display_name, _ in target_categories:
+        raw_p = found_map.get(display_name)
+        if raw_p is not None:
+            result.append({
+                "name": display_name,
+                "price": round(raw_p * (1 - DISCOUNT_PERCENT / 100))
+            })
         else:
             result.append({"name": display_name, "price": None})
     return result
 
 
 async def fetch_topbilet_prices(retry_on_empty: bool = True):
-    logging.info("Запускаю легкий парсинг Topbilet...")
+    logging.info("Запускаю парсинг Topbilet через API/HTML...")
     try:
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             async with session.get(TARGET_URL, timeout=30) as resp:
                 html = await resp.text()
 
+            combined_chunks = [html]
             soup = BeautifulSoup(html, "html.parser")
-            combined_text = soup.get_text("\n")
 
-            extra_urls = set()
-            for tag in soup.find_all(["iframe", "a", "script"]):
-                src = tag.get("src") or tag.get("href") or ""
-                if any(k in src.lower() for k in ["widget", "ticket", "seat", "hall", "checkout", "buy", "event"]):
-                    if src.startswith("//"):
-                        src = "https:" + src
-                    elif src.startswith("/"):
-                        src = "https://topbilet.kz" + src
-                    if src.startswith("http") and src != TARGET_URL:
-                        extra_urls.add(src)
+            # Собираем все ссылки на виджеты, API и JS-бандлы события
+            candidate_urls = set()
+            for tag in soup.find_all(["iframe", "a", "script", "div"]):
+                for attr in ("src", "href", "data-url", "data-src", "data-widget", "data-event-id", "data-id"):
+                    val = tag.get(attr)
+                    if not val or not isinstance(val, str):
+                        continue
+                    if val.startswith("//"):
+                        candidate_urls.add("https:" + val)
+                    elif val.startswith("/") and any(k in val.lower() for k in ["api", "event", "ticket", "widget", "session", "hall", "seat"]):
+                        candidate_urls.add("https://topbilet.kz" + val)
+                    elif val.startswith("http") and any(k in val.lower() for k in ["topbilet", "ticket", "widget", "api", "event", "session", "seat", "hall"]):
+                        candidate_urls.add(val)
 
+            # Ищем скрытые API-пути и ID события внутри inline-скриптов (Next.js / Nuxt / Vue / Laravel)
             for script in soup.find_all("script"):
-                if script.string:
-                    for m in re.findall(r"https?://[^\s\"'<>]+(?:widget|ticket|hall|session|event)[^\s\"'<>]*", script.string):
-                        extra_urls.add(m)
+                if not script.string:
+                    continue
+                for m in re.findall(r"https?://[^\s\"'<>\\]+", script.string):
+                    if any(k in m.lower() for k in ["api", "widget", "ticket", "event", "session", "seat", "hall", "price"]):
+                        candidate_urls.add(m)
+                for m in re.findall(r"[\"'](/api/[^\"'<>\\]+|/ru/[^\"'<>\\]+|/widget/[^\"'<>\\]+)[\"']", script.string):
+                    candidate_urls.add("https://topbilet.kz" + m)
 
-            for url in list(extra_urls)[:8]:
+            # Извлекаем числовые ID события из HTML/URL (например event_id / session_id)
+            event_ids = set(re.findall(r"(?:event_id|session_id|eventId|sessionId|widget_id)[\"']?\s*[:=]\s*[\"']?(\d{3,10})", html))
+            for eid in list(event_ids)[:5]:
+                candidate_urls.update([
+                    f"https://topbilet.kz/api/events/{eid}",
+                    f"https://topbilet.kz/api/event/{eid}",
+                    f"https://topbilet.kz/api/sessions/{eid}",
+                    f"https://topbilet.kz/api/tickets/{eid}",
+                    f"https://topbilet.kz/widget/event/{eid}",
+                ])
+
+            logging.info(f"Найдено кандидатов URL/API: {len(candidate_urls)}")
+
+            for url in list(candidate_urls)[:20]:
+                if url == TARGET_URL or url.endswith((".png", ".jpg", ".css", ".woff2", ".svg")):
+                    continue
                 try:
-                    async with session.get(url, timeout=15) as sub_resp:
+                    async with session.get(url, timeout=12) as sub_resp:
                         if sub_resp.status == 200:
-                            sub_text = await sub_resp.text()
-                            sub_soup = BeautifulSoup(sub_text, "html.parser")
-                            combined_text += "\n" + sub_soup.get_text("\n")
+                            txt = await sub_resp.text()
+                            if any(w in txt.lower() for w in ["танцпол", "ранний", "vip", "price", "ticket"]):
+                                logging.info(f"Нашел полезные данные в: {url}")
+                                combined_chunks.append(txt)
                 except Exception:
                     pass
 
-            result = extract_prices_from_text(combined_text)
+            result = parse_prices_from_any("\n".join(combined_chunks))
             found_any = any(item["price"] is not None for item in result)
 
             if found_any or not price_data["tickets"]:
@@ -172,14 +240,4 @@ async def main():
         BotCommand(command="price", description="🎟 Актуальные цены")
     ])
 
-    asyncio.create_task(fetch_topbilet_prices())
-
-    scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
-    scheduler.add_job(fetch_topbilet_prices, "cron", hour=10, minute=0)
-    scheduler.start()
-
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.
