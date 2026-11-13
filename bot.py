@@ -1,29 +1,23 @@
 import asyncio
-import json
 import logging
 import os
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
-import aiohttp
-from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_СЮДА_СВОЙ_ТОКЕН")
 TARGET_URL = "https://topbilet.kz/ru/event/platina-v-almaty-2"
 DISCOUNT_PERCENT = 40
 ALMATY_TZ = ZoneInfo("Asia/Almaty")
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-    "Referer": TARGET_URL,
-}
 
 price_data = {
     "tickets": [],
@@ -43,149 +37,120 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 
-def parse_prices_from_any(raw_text: str) -> list[dict]:
-    """Ищет цены как в обычном тексте, так и внутри JSON-ответов API виджетов."""
-    target_categories = [
-        ("Танцпол", "танцпол"),
-        ("Ранний Вход", "ранний вход"),
-        ("VIP", "vip")
-    ]
-    found_map = {}
+def scrape_sync() -> str:
+    options = Options()
+    if os.path.exists("/usr/bin/google-chrome"):
+        options.binary_location = "/usr/bin/google-chrome"
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--window-size=1280,900")
+    options.add_argument("--js-flags=--max-old-space-size=128")
+    options.page_load_strategy = "eager"
 
-    # 1. Пробуем распарсить как JSON (наиболее частый формат API билетных виджетов)
-    def walk_json(obj):
-        if isinstance(obj, dict):
-            name_val = ""
-            price_val = None
-            for k, v in obj.items():
-                kl = k.lower()
-                if kl in ("name", "title", "category", "sector", "tariff", "label") and isinstance(v, str):
-                    name_val = v.lower()
-                elif kl in ("price", "cost", "amount", "value", "minprice", "min_price"):
-                    if isinstance(v, (int, float)) and 3000 <= v <= 500000:
-                        price_val = int(v)
-                    elif isinstance(v, str) and v.isdigit() and 3000 <= int(v) <= 500000:
-                        price_val = int(v)
-            if name_val and price_val:
-                for display_name, prefix in target_categories:
-                    if prefix in name_val and display_name not in found_map:
-                        found_map[display_name] = price_val
-            for v in obj.values():
-                walk_json(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk_json(item)
+    # Отключаем загрузку картинок и шрифтов для экономии оперативной памяти
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.managed_default_content_settings.fonts": 2,
+    }
+    options.add_experimental_option("prefs", prefs)
+
+    service = Service("/usr/local/bin/chromedriver") if os.path.exists("/usr/local/bin/chromedriver") else Service()
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(45)
 
     try:
-        parsed = json.loads(raw_text)
-        walk_json(parsed)
-    except Exception:
-        pass
+        driver.get(TARGET_URL)
+        driver.implicitly_wait(5)
 
-    # 2. Если в JSON не нашлось, ищем регулярками по тексту/HTML/JS-переменным
-    if len(found_map) < 3:
-        clean_text = BeautifulSoup(raw_text, "html.parser").get_text("\n")
-        lines = [line.strip() for line in clean_text.splitlines() if line.strip()]
-        for display_name, prefix in target_categories:
-            if display_name in found_map:
-                continue
-            for idx, line in enumerate(lines):
-                if prefix in line.lower():
-                    chunk = " ".join(lines[idx:idx + 5])
-                    match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*(?:₸|KZT|тг)?", chunk, re.IGNORECASE)
-                    if match:
-                        num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
-                        if 3000 <= num <= 500000:
-                            found_map[display_name] = num
-                            break
+        # Ищем и нажимаем кнопку "Купить билет"
+        buttons = driver.find_elements(By.XPATH, "//*[contains(text(), 'Купить билет')]")
+        for btn in buttons:
+            if btn.is_displayed():
+                driver.execute_script("arguments[0].click();", btn)
+                break
 
-    result = []
-    for display_name, _ in target_categories:
-        raw_p = found_map.get(display_name)
-        if raw_p is not None:
-            result.append({
-                "name": display_name,
-                "price": round(raw_p * (1 - DISCOUNT_PERCENT / 100))
-            })
-        else:
-            result.append({"name": display_name, "price": None})
-    return result
+        full_text = ""
+        for attempt in range(40):
+            driver.implicitly_wait(1)
+            import time
+            time.sleep(1)
+
+            texts = []
+            for handle in driver.window_handles:
+                driver.switch_to.window(handle)
+                try:
+                    texts.append(driver.find_element(By.TAG_NAME, "body").text)
+                except Exception:
+                    pass
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                for frame in iframes:
+                    try:
+                        driver.switch_to.frame(frame)
+                        texts.append(driver.find_element(By.TAG_NAME, "body").text)
+                        driver.switch_to.default_content()
+                    except Exception:
+                        driver.switch_to.default_content()
+
+            full_text = "\n".join(texts)
+            if "танцпол" in full_text.lower() and "₸" in full_text:
+                logging.info(f"Страница с ценами загрузилась за {attempt + 1} сек!")
+                break
+
+        return full_text
+    finally:
+        driver.quit()
 
 
 async def fetch_topbilet_prices(retry_on_empty: bool = True):
-    logging.info("Запускаю парсинг Topbilet через API/HTML...")
+    logging.info("Запускаю парсинг Topbilet через встроенный Chrome...")
     try:
-        async with aiohttp.ClientSession(headers=HEADERS) as session:
-            async with session.get(TARGET_URL, timeout=30) as resp:
-                html = await resp.text()
+        loop = asyncio.get_running_loop()
+        full_text = await loop.run_in_executor(None, scrape_sync)
 
-            combined_chunks = [html]
-            soup = BeautifulSoup(html, "html.parser")
+        lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+        target_categories = [
+            ("Танцпол", "танцпол"),
+            ("Ранний Вход", "ранний вход"),
+            ("VIP", "vip")
+        ]
 
-            # Собираем все ссылки на виджеты, API и JS-бандлы события
-            candidate_urls = set()
-            for tag in soup.find_all(["iframe", "a", "script", "div"]):
-                for attr in ("src", "href", "data-url", "data-src", "data-widget", "data-event-id", "data-id"):
-                    val = tag.get(attr)
-                    if not val or not isinstance(val, str):
-                        continue
-                    if val.startswith("//"):
-                        candidate_urls.add("https:" + val)
-                    elif val.startswith("/") and any(k in val.lower() for k in ["api", "event", "ticket", "widget", "session", "hall", "seat"]):
-                        candidate_urls.add("https://topbilet.kz" + val)
-                    elif val.startswith("http") and any(k in val.lower() for k in ["topbilet", "ticket", "widget", "api", "event", "session", "seat", "hall"]):
-                        candidate_urls.add(val)
+        result = []
+        found_any = False
 
-            # Ищем скрытые API-пути и ID события внутри inline-скриптов (Next.js / Nuxt / Vue / Laravel)
-            for script in soup.find_all("script"):
-                if not script.string:
-                    continue
-                for m in re.findall(r"https?://[^\s\"'<>\\]+", script.string):
-                    if any(k in m.lower() for k in ["api", "widget", "ticket", "event", "session", "seat", "hall", "price"]):
-                        candidate_urls.add(m)
-                for m in re.findall(r"[\"'](/api/[^\"'<>\\]+|/ru/[^\"'<>\\]+|/widget/[^\"'<>\\]+)[\"']", script.string):
-                    candidate_urls.add("https://topbilet.kz" + m)
+        for display_name, prefix in target_categories:
+            found_price = None
+            for idx, line in enumerate(lines):
+                if line.lower().startswith(prefix):
+                    chunk = " ".join(lines[idx:idx + 4])
+                    match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*₸", chunk)
+                    if match:
+                        num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
+                        if 3000 <= num <= 500000:
+                            found_price = num
+                            break
 
-            # Извлекаем числовые ID события из HTML/URL (например event_id / session_id)
-            event_ids = set(re.findall(r"(?:event_id|session_id|eventId|sessionId|widget_id)[\"']?\s*[:=]\s*[\"']?(\d{3,10})", html))
-            for eid in list(event_ids)[:5]:
-                candidate_urls.update([
-                    f"https://topbilet.kz/api/events/{eid}",
-                    f"https://topbilet.kz/api/event/{eid}",
-                    f"https://topbilet.kz/api/sessions/{eid}",
-                    f"https://topbilet.kz/api/tickets/{eid}",
-                    f"https://topbilet.kz/widget/event/{eid}",
-                ])
-
-            logging.info(f"Найдено кандидатов URL/API: {len(candidate_urls)}")
-
-            for url in list(candidate_urls)[:20]:
-                if url == TARGET_URL or url.endswith((".png", ".jpg", ".css", ".woff2", ".svg")):
-                    continue
-                try:
-                    async with session.get(url, timeout=12) as sub_resp:
-                        if sub_resp.status == 200:
-                            txt = await sub_resp.text()
-                            if any(w in txt.lower() for w in ["танцпол", "ранний", "vip", "price", "ticket"]):
-                                logging.info(f"Нашел полезные данные в: {url}")
-                                combined_chunks.append(txt)
-                except Exception:
-                    pass
-
-            result = parse_prices_from_any("\n".join(combined_chunks))
-            found_any = any(item["price"] is not None for item in result)
-
-            if found_any or not price_data["tickets"]:
-                price_data["tickets"] = result
-                price_data["updated_at"] = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y %H:%M")
-                logging.info(f"Цены обновлены: {result}")
+            if found_price is not None:
+                found_any = True
+                final_price = round(found_price * (1 - DISCOUNT_PERCENT / 100))
+                result.append({"name": display_name, "price": final_price})
             else:
-                logging.warning("Парсер вернул пустой список, оставляю предыдущие цены.")
+                result.append({"name": display_name, "price": None})
 
-            if not found_any and retry_on_empty:
-                logging.info("Повторная попытка парсинга через 15 секунд...")
-                await asyncio.sleep(15)
-                await fetch_topbilet_prices(retry_on_empty=False)
+        if found_any or not price_data["tickets"]:
+            price_data["tickets"] = result
+            price_data["updated_at"] = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y %H:%M")
+            logging.info(f"Цены обновлены: {result}")
+        else:
+            logging.warning("Парсер вернул пустой список, оставляю предыдущие цены.")
+
+        if not found_any and retry_on_empty:
+            logging.info("Повторная попытка парсинга через 15 секунд...")
+            await asyncio.sleep(15)
+            await fetch_topbilet_prices(retry_on_empty=False)
 
     except Exception as e:
         logging.error(f"Ошибка при парсинге Topbilet: {e}")
@@ -240,4 +205,14 @@ async def main():
         BotCommand(command="price", description="🎟 Актуальные цены")
     ])
 
-    asyncio.
+    asyncio.create_task(fetch_topbilet_prices())
+
+    scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
+    scheduler.add_job(fetch_topbilet_prices, "cron", hour=10, minute=0)
+    scheduler.start()
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
