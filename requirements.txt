@@ -1,4 +1,4 @@
 aiogram
 apscheduler
-playwright
-tzdata
+aiohttp
+beautifulsoup4
