@@ -27,13 +27,17 @@ price_data = {
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+parse_lock = asyncio.Lock()
 
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🎟 Актуальные цены")]
+        [
+            KeyboardButton(text="🎟 Актуальные цены"),
+            KeyboardButton(text="🔄 Обновить цены")
+        ]
     ],
     resize_keyboard=True,
-    input_field_placeholder="Нажмите кнопку ниже, чтобы узнать цены"
+    input_field_placeholder="Выберите действие ниже"
 )
 
 
@@ -51,7 +55,6 @@ def scrape_sync() -> str:
     options.add_argument("--js-flags=--max-old-space-size=128")
     options.page_load_strategy = "eager"
 
-    # Отключаем загрузку картинок и шрифтов для экономии оперативной памяти
     prefs = {
         "profile.managed_default_content_settings.images": 2,
         "profile.managed_default_content_settings.fonts": 2,
@@ -66,7 +69,6 @@ def scrape_sync() -> str:
         driver.get(TARGET_URL)
         driver.implicitly_wait(5)
 
-        # Ищем и нажимаем кнопку "Купить билет"
         buttons = driver.find_elements(By.XPATH, "//*[contains(text(), 'Купить билет')]")
         for btn in buttons:
             if btn.is_displayed():
@@ -75,7 +77,6 @@ def scrape_sync() -> str:
 
         full_text = ""
         for attempt in range(40):
-            driver.implicitly_wait(1)
             import time
             time.sleep(1)
 
@@ -106,57 +107,83 @@ def scrape_sync() -> str:
 
 
 async def fetch_topbilet_prices(retry_on_empty: bool = True):
-    logging.info("Запускаю парсинг Topbilet через встроенный Chrome...")
-    try:
-        loop = asyncio.get_running_loop()
-        full_text = await loop.run_in_executor(None, scrape_sync)
+    if parse_lock.locked():
+        logging.info("Парсинг уже выполняется, пропускаю дублирующий запуск.")
+        return
 
-        lines = [line.strip() for line in full_text.splitlines() if line.strip()]
-        target_categories = [
-            ("Танцпол", "танцпол"),
-            ("Ранний Вход", "ранний вход"),
-            ("VIP", "vip")
-        ]
+    async with parse_lock:
+        logging.info("Запускаю парсинг Topbilet через встроенный Chrome...")
+        try:
+            loop = asyncio.get_running_loop()
+            full_text = await loop.run_in_executor(None, scrape_sync)
 
-        result = []
-        found_any = False
+            lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+            target_categories = [
+                ("Танцпол", "танцпол"),
+                ("Ранний Вход", "ранний вход"),
+                ("VIP", "vip")
+            ]
 
-        for display_name, prefix in target_categories:
-            found_price = None
-            for idx, line in enumerate(lines):
-                if line.lower().startswith(prefix):
-                    chunk = " ".join(lines[idx:idx + 4])
-                    match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*₸", chunk)
-                    if match:
-                        num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
-                        if 3000 <= num <= 500000:
-                            found_price = num
-                            break
+            result = []
+            found_any = False
 
-            if found_price is not None:
-                found_any = True
-                final_price = round(found_price * (1 - DISCOUNT_PERCENT / 100))
-                result.append({"name": display_name, "price": final_price})
+            for display_name, prefix in target_categories:
+                found_price = None
+                for idx, line in enumerate(lines):
+                    if line.lower().startswith(prefix):
+                        chunk = " ".join(lines[idx:idx + 4])
+                        match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*₸", chunk)
+                        if match:
+                            num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
+                            if 3000 <= num <= 500000:
+                                found_price = num
+                                break
+
+                if found_price is not None:
+                    found_any = True
+                    final_price = round(found_price * (1 - DISCOUNT_PERCENT / 100))
+                    result.append({"name": display_name, "price": final_price})
+                else:
+                    result.append({"name": display_name, "price": None})
+
+            if found_any or not price_data["tickets"]:
+                price_data["tickets"] = result
+                price_data["updated_at"] = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y %H:%M")
+                logging.info(f"Цены обновлены: {result}")
             else:
-                result.append({"name": display_name, "price": None})
+                logging.warning("Парсер вернул пустой список, оставляю предыдущие цены.")
 
-        if found_any or not price_data["tickets"]:
-            price_data["tickets"] = result
-            price_data["updated_at"] = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y %H:%M")
-            logging.info(f"Цены обновлены: {result}")
-        else:
-            logging.warning("Парсер вернул пустой список, оставляю предыдущие цены.")
+            if not found_any and retry_on_empty:
+                logging.info("Повторная попытка парсинга через 15 секунд...")
+                await asyncio.sleep(15)
+                full_text_retry = await loop.run_in_executor(None, scrape_sync)
+                # Повторная проверка
+                lines_r = [line.strip() for line in full_text_retry.splitlines() if line.strip()]
+                res_r = []
+                found_r = False
+                for display_name, prefix in target_categories:
+                    fp = None
+                    for idx, line in enumerate(lines_r):
+                        if line.lower().startswith(prefix):
+                            chunk = " ".join(lines_r[idx:idx + 4])
+                            match = re.search(r"(\d{1,3}(?:[\s\u00A0]\d{3})+|\d{4,6})\s*₸", chunk)
+                            if match:
+                                num = int(re.sub(r"[\s\u00A0]+", "", match.group(1)))
+                                if 3000 <= num <= 500000:
+                                    fp = num
+                                    break
+                    if fp is not None:
+                        found_r = True
+                        res_r.append({"name": display_name, "price": round(fp * (1 - DISCOUNT_PERCENT / 100))})
+                    else:
+                        res_r.append({"name": display_name, "price": None})
+                if found_r:
+                    price_data["tickets"] = res_r
+                    price_data["updated_at"] = datetime.now(ALMATY_TZ).strftime("%d.%m.%Y %H:%M")
+                    logging.info(f"Цены обновлены со второй попытки: {res_r}")
 
-        if not found_any and retry_on_empty:
-            logging.info("Повторная попытка парсинга через 15 секунд...")
-            await asyncio.sleep(15)
-            await fetch_topbilet_prices(retry_on_empty=False)
-
-    except Exception as e:
-        logging.error(f"Ошибка при парсинге Topbilet: {e}")
-        if retry_on_empty:
-            await asyncio.sleep(15)
-            await fetch_topbilet_prices(retry_on_empty=False)
+        except Exception as e:
+            logging.error(f"Ошибка при парсинге Topbilet: {e}")
 
 
 def format_num(n: int) -> str:
@@ -194,7 +221,11 @@ async def cmd_price(message: types.Message):
 
 
 @dp.message(Command("force_update"))
+@dp.message(F.text == "🔄 Обновить цены")
 async def cmd_force_update(message: types.Message):
+    if parse_lock.locked():
+        await message.answer("⏳ Цены уже обновляются, подождите пару секунд...", reply_markup=main_keyboard)
+        return
     await message.answer("🔄 Обновляю актуальные цены...", reply_markup=main_keyboard)
     await fetch_topbilet_prices(retry_on_empty=False)
     await send_prices(message)
@@ -202,17 +233,4 @@ async def cmd_force_update(message: types.Message):
 
 async def main():
     await bot.set_my_commands([
-        BotCommand(command="price", description="🎟 Актуальные цены")
-    ])
-
-    asyncio.create_task(fetch_topbilet_prices())
-
-    scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
-    scheduler.add_job(fetch_topbilet_prices, "cron", hour=10, minute=0)
-    scheduler.start()
-
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        BotCommand(command="
