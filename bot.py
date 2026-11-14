@@ -233,4 +233,18 @@ async def cmd_force_update(message: types.Message):
 
 async def main():
     await bot.set_my_commands([
-        BotCommand(command="
+        BotCommand(command="price", description="🎟 Актуальные цены"),
+        BotCommand(command="force_update", description="🔄 Обновить цены")
+    ])
+
+    asyncio.create_task(fetch_topbilet_prices())
+
+    scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
+    scheduler.add_job(fetch_topbilet_prices, "cron", hour=10, minute=0)
+    scheduler.start()
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
