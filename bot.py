@@ -1,7 +1,9 @@
 import asyncio
+import gc
 import logging
 import os
 import re
+import subprocess
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -42,13 +44,15 @@ def scrape_sync() -> str:
     for arg in (
         "--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
         "--disable-gpu", "--disable-extensions", "--disable-background-networking",
-        "--window-size=1280,900", "--js-flags=--max-old-space-size=128"
+        "--disable-software-rasterizer", "--no-zygote", "--renderer-process-limit=1",
+        "--window-size=1024,768", "--js-flags=--max-old-space-size=96"
     ):
         options.add_argument(arg)
     options.page_load_strategy = "eager"
     options.add_experimental_option("prefs", {
         "profile.managed_default_content_settings.images": 2,
         "profile.managed_default_content_settings.fonts": 2,
+        "profile.managed_default_content_settings.stylesheets": 2,
     })
 
     service = Service("/usr/local/bin/chromedriver") if os.path.exists("/usr/local/bin/chromedriver") else Service()
@@ -88,7 +92,12 @@ def scrape_sync() -> str:
                 break
         return full_text
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        subprocess.run(["pkill", "-9", "-f", "chrome"], stderr=subprocess.DEVNULL)
+        gc.collect()
 
 
 def parse_lines(full_text: str) -> tuple[list[dict], bool]:
@@ -179,7 +188,7 @@ async def main():
     ])
     asyncio.create_task(fetch_topbilet_prices())
     scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
-    scheduler.add_job(fetch_topbilet_prices, "cron", hour=10, minute=0)
+    scheduler.add_job(fetch_topbilet_prices, "cron", minute=0)
     scheduler.start()
     await dp.start_polling(bot)
 
