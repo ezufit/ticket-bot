@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BotCommand
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -190,14 +190,6 @@ async def main():
 
     while True:
         try:
-            try:
-                await bot.set_my_commands([
-                    BotCommand(command="price", description="🎟 Актуальные цены"),
-                    BotCommand(command="force_update", description="🔄 Обновить цены")
-                ])
-            except Exception as e:
-                logging.warning(f"Пропускаю set_my_commands: {e}")
-
             await dp.start_polling(bot)
             break
         except TelegramRetryAfter as e:
