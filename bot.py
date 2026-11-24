@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, BotCommand
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -182,19 +183,29 @@ async def cmd_force_update(message: types.Message):
 
 
 async def main():
-    try:
-        await bot.set_my_commands([
-            BotCommand(command="price", description="🎟 Актуальные цены"),
-            BotCommand(command="force_update", description="🔄 Обновить цены")
-        ])
-    except Exception as e:
-        logging.warning(f"Пропускаю обновление меню команд из-за лимита Telegram: {e}")
-
     asyncio.create_task(fetch_topbilet_prices())
     scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
     scheduler.add_job(fetch_topbilet_prices, "cron", minute=0)
     scheduler.start()
-    await dp.start_polling(bot)
+
+    while True:
+        try:
+            try:
+                await bot.set_my_commands([
+                    BotCommand(command="price", description="🎟 Актуальные цены"),
+                    BotCommand(command="force_update", description="🔄 Обновить цены")
+                ])
+            except Exception as e:
+                logging.warning(f"Пропускаю set_my_commands: {e}")
+
+            await dp.start_polling(bot)
+            break
+        except TelegramRetryAfter as e:
+            logging.warning(f"Флуд-контроль Telegram при старте, жду {e.retry_after + 2} сек...")
+            await asyncio.sleep(e.retry_after + 2)
+        except Exception as e:
+            logging.error(f"Ошибка polling: {e}, перезапуск через 5 сек...")
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
