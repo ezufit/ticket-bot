@@ -182,10 +182,14 @@ async def cmd_force_update(message: types.Message):
 
 
 async def main():
-    await bot.set_my_commands([
-        BotCommand(command="price", description="🎟 Актуальные цены"),
-        BotCommand(command="force_update", description="🔄 Обновить цены")
-    ])
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="price", description="🎟 Актуальные цены"),
+            BotCommand(command="force_update", description="🔄 Обновить цены")
+        ])
+    except Exception as e:
+        logging.warning(f"Пропускаю обновление меню команд из-за лимита Telegram: {e}")
+
     asyncio.create_task(fetch_topbilet_prices())
     scheduler = AsyncIOScheduler(timezone=ALMATY_TZ)
     scheduler.add_job(fetch_topbilet_prices, "cron", minute=0)
